@@ -18,8 +18,9 @@ import { compoundedSofr, averageFromIndex, indexFromRates } from "compounded-sof
 compoundedSofr({ observations, start: "2026-06-09", end: "2026-07-09" });
 // 3.63409 — matches the NY Fed's published 30-day SOFR average for 2026-07-09
 
-// The exact, path-independent method straight from the published SOFR Index:
-averageFromIndex(1.24986240, 1.25036103, 30); // the 30-day average
+// The exact, path-independent method straight from the published SOFR Index
+// (index on 2026-06-09 and 2026-07-09, 30 calendar days apart):
+averageFromIndex(1.24646364, 1.25023844, 30); // 3.63409 — the same 30-day average
 
 // Reconstruct the SOFR Index by compounding the daily series (seeded 1.0 on 2018-04-02):
 indexFromRates(observations, 1.0);
