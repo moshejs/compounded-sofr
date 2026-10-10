@@ -1,6 +1,6 @@
 {
   "name": "compounded-sofr",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "SOFR / risk-free-rate compounding-in-arrears math — ARRC & ISDA conventions (lookback, observation shift, lockout), the SOFR Index method, and the compounded average. Reproduces the NY Fed's published values. Zero dependencies.",
   "keywords": [
     "sofr",
