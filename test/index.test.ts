@@ -6,10 +6,12 @@ import {
   compoundedSofr,
   dailySimpleAverage,
   indexFromRates,
+  sofrAverage,
   weightedRates,
   withSpreadAdjustment,
 } from "../src/index.js";
 import fixtures from "./fixtures.json";
+import { QUANTLIB_CASES } from "./quantlib-fixtures.js";
 
 const SOFR: { date: string; rate: number }[] = fixtures.sofr;
 const INDEX: Record<string, number> = fixtures.index;
@@ -172,5 +174,125 @@ describe("accrual, spread, and validation", () => {
     expect(() => compoundedSofr({ observations: SOFR, start: "1999-01-01", end: "2026-01-01" })).toThrow(
       RangeError,
     );
+  });
+});
+
+describe("sofrAverage — reproduces every published NY Fed SOFR Average exactly", () => {
+  for (const [tenor, published] of [[30, AVG30], [90, AVG90], [180, AVG180]] as const) {
+    it(`${tenor}-day average, all published dates (incl. weekend/holiday window starts)`, () => {
+      let weekendStarts = 0;
+      for (const [asOf, value] of Object.entries(published)) {
+        expect(sofrAverage(SOFR, asOf, tenor), `${tenor}d ${asOf}`).toBe(value);
+        if (INDEX[minus(asOf, tenor)] === undefined) weekendStarts++;
+      }
+      expect(Object.keys(published).length).toBe(250);
+      expect(weekendStarts).toBeGreaterThan(50);
+    });
+  }
+
+  it("needs only rates through the business day before asOf", () => {
+    // 2026-07-10 average uses rates through 2026-07-09 (the last observation)
+    expect(sofrAverage(SOFR, "2026-07-10", 30)).toBe(AVG30["2026-07-10"]);
+  });
+
+  it("README example", () => {
+    expect(compoundedSofr({ observations: SOFR, start: "2026-06-09", end: "2026-07-09" })).toBeCloseTo(3.63409, 5);
+    expect(averageFromIndex(1.24646364, 1.25023844, 30)).toBeCloseTo(3.63409, 5);
+  });
+});
+
+describe("indexFromRates — chains to the published index at every date", () => {
+  it("seeded from a published (rounded) value, stays within 1e-8 on all 250 dates", () => {
+    const first = Object.keys(INDEX).sort()[0]!;
+    const from = SOFR.findIndex((o) => o.date === first);
+    for (let i = from + 1; i < SOFR.length; i++) {
+      const v = indexFromRates(SOFR.slice(from, i + 1), INDEX[first]!);
+      // the seed itself is rounded to 8 dp, so allow one unit in the last place
+      expect(Math.abs(v - INDEX[SOFR[i]!.date]!), SOFR[i]!.date).toBeLessThan(1.1e-8);
+    }
+  });
+});
+
+describe("conventions match QuantLib OvernightIndexedCoupon", () => {
+  it(`${QUANTLIB_CASES.length} reference cases: rate and accrued amount`, () => {
+    for (const c of QUANTLIB_CASES) {
+      const params = {
+        observations: SOFR,
+        start: c.start,
+        end: c.end,
+        convention:
+          c.convention === "plain"
+            ? ({ type: "plain" } as const)
+            : { type: c.convention, businessDays: c.businessDays },
+      };
+      const label = `${c.convention}(${c.businessDays}) ${c.start}→${c.end}`;
+      expect(compoundedSofr(params), label).toBeCloseTo(c.rate, 9);
+      expect(accruedInterest(1_000_000, params), label).toBeCloseTo(c.amount, 6);
+    }
+  });
+
+  it("observation-shift interest accrues over the interest period, not the observation period", () => {
+    // interest period 2026-01-02 → 2026-01-09 is 7 days; shifted 5 business days back over the
+    // Christmas and New Year holidays, the observation period is 2025-12-24 → 2026-01-02 (9 days)
+    const params = {
+      observations: SOFR,
+      start: "2026-01-02",
+      end: "2026-01-09",
+      convention: { type: "observationShift", businessDays: 5 } as const,
+    };
+    const obsDays = weightedRates(params).reduce((s, p) => s + p.days, 0);
+    expect(obsDays).toBe(9); // 2025-12-24 → 2026-01-02
+    const rate = compoundedSofr(params);
+    expect(accruedInterest(1_000_000, params)).toBeCloseTo(1_000_000 * (rate / 100) * (7 / 360), 8);
+  });
+
+  it("weekend start takes the preceding business day's rate", () => {
+    // Saturday 2026-06-06 → Monday 2026-06-08: Friday 2026-06-05's rate for 2 days
+    const fri = SOFR.find((o) => o.date === "2026-06-05")!;
+    expect(weightedRates({ observations: SOFR, start: "2026-06-06", end: "2026-06-08" })).toEqual([
+      { rate: fri.rate, days: 2 },
+    ]);
+  });
+});
+
+describe("period validation", () => {
+  it("rejects a lockout as long as the period", () => {
+    expect(() =>
+      compoundedSofr({
+        observations: SOFR,
+        start: "2026-06-01",
+        end: "2026-06-04",
+        convention: { type: "lockout", businessDays: 3 },
+      }),
+    ).toThrow(/lockout/);
+  });
+
+  it("rejects an end far past the last observation", () => {
+    expect(() => compoundedSofr({ observations: SOFR, start: "2026-06-09", end: "2026-07-31" })).toThrow(
+      /Observations end/,
+    );
+  });
+
+  it("observation shift requires business-day start and end", () => {
+    expect(() =>
+      compoundedSofr({
+        observations: SOFR,
+        start: "2026-06-06",
+        end: "2026-07-09",
+        convention: { type: "observationShift", businessDays: 2 },
+      }),
+    ).toThrow(/not a business day/);
+  });
+
+  it("rejects malformed dates and bad businessDays", () => {
+    expect(() => compoundedSofr({ observations: SOFR, start: "2026-6-9", end: "2026-07-09" })).toThrow(RangeError);
+    expect(() =>
+      compoundedSofr({
+        observations: SOFR,
+        start: "2026-06-09",
+        end: "2026-07-09",
+        convention: { type: "lookback", businessDays: 1.5 },
+      }),
+    ).toThrow(RangeError);
   });
 });
