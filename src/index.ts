@@ -74,6 +74,7 @@ export function dailySimpleAverage(periods: readonly WeightedRate[]): number {
   let weighted = 0;
   let totalDays = 0;
   for (const p of periods) {
+    if (!Number.isFinite(p.rate)) throw new RangeError(`Invalid rate: ${p.rate}`);
     if (!Number.isInteger(p.days) || p.days <= 0) {
       throw new RangeError(`days must be a positive integer, got ${p.days}`);
     }
@@ -89,8 +90,14 @@ export function dailySimpleAverage(periods: readonly WeightedRate[]): number {
  * `(indexEnd / indexStart − 1) × 360 / days`, returned as a percent.
  *
  * ```ts
- * averageFromIndex(1.24986240, 1.25036103, 30); // ≈ the NY Fed's published 30-day average
+ * // published index on 2026-06-09 and 2026-07-09 (30 calendar days apart)
+ * averageFromIndex(1.24646364, 1.25023844, 30); // 3.634089… (published 30-day average: 3.63409)
  * ```
+ *
+ * The published index is rounded to 8 decimals, so this agrees with the NY
+ * Fed's published averages (computed from the daily rates) to within about
+ * 2e-5 percentage points, not always to the 5th decimal. Use
+ * {@link sofrAverage} with the daily rates to reproduce them exactly.
  */
 export function averageFromIndex(startIndex: number, endIndex: number, days: number): number {
   if (!Number.isFinite(startIndex) || startIndex <= 0) {
@@ -110,8 +117,11 @@ export function averageFromIndex(startIndex: number, endIndex: number, days: num
  * `index_{i+1} = index_i × (1 + rate_i/100 × n_i/360)`. Returns the index
  * value as of the last observation's date.
  *
- * Reproduces the NY Fed's published SOFR Index (which is seeded at
- * 1.00000000 on 2018-04-02) to 1e-8.
+ * Reproduces the NY Fed's published SOFR Index (seeded at 1.00000000 on
+ * 2018-04-02): compounding the full daily history and rounding to 8 decimals
+ * gives the published value. The index published on date D includes the
+ * rate for the business day before D, so include D's observation (any rate)
+ * as the last element to get D's index.
  */
 export function indexFromRates(
   observations: readonly RateObservation[],
@@ -130,6 +140,18 @@ export function indexFromRates(
   return index;
 }
 
+/**
+ * Interest-period conventions (ARRC / ISDA 2021 / QuantLib):
+ * - `plain` — each business day's own rate, interest-period weights.
+ * - `lookback` — rate from `businessDays` business days earlier, weights from
+ *   the interest period ("lookback without observation shift").
+ * - `observationShift` — rates and weights both from the observation period
+ *   shifted `businessDays` business days earlier.
+ * - `lockout` — the last `businessDays` business days of the period reuse the
+ *   rate of the business day just before them (QuantLib `lockoutDays`). An
+ *   ARRC-style "Rate Cut-Off Date" N business days before the period end
+ *   (rate of the cut-off date applies from it onward) is `businessDays: N − 1`.
+ */
 export type Convention =
   | { type: "plain" }
   | { type: "lookback"; businessDays: number }
@@ -143,9 +165,17 @@ export interface CompoundedSofrParams {
    * days as well.
    */
   observations: readonly RateObservation[];
-  /** Interest period start (inclusive), YYYY-MM-DD, a business day in `observations`. */
+  /**
+   * Interest period start (inclusive), YYYY-MM-DD. If it is not a business
+   * day, the preceding business day's rate applies (must be in
+   * `observations`). Must be a business day for `observationShift`.
+   */
   start: string;
-  /** Interest period end (exclusive), YYYY-MM-DD, a business day in `observations`. */
+  /**
+   * Interest period end (exclusive), YYYY-MM-DD. Its own rate is never used;
+   * it need not be in `observations` (except for `observationShift`), but may
+   * be at most 7 calendar days after the last observation.
+   */
   end: string;
   /** Convention. Default `{ type: "plain" }`. */
   convention?: Convention;
@@ -167,70 +197,109 @@ function sortObservations(observations: readonly RateObservation[]): RateObserva
 }
 
 /**
+ * A period may run at most this many calendar days past the last observation
+ * (so the NY Fed's average for date D can be computed from rates through
+ * D − 1), guarding against silently truncated data.
+ */
+const MAX_TRAILING_GAP_DAYS = 7;
+
+/**
  * Build the weighted (rate, days) periods for an interest period under a
  * convention — the schedule that {@link compoundInArrears} consumes. Exposed
  * so callers can inspect or reuse the weighting.
+ *
+ * `start` and `end` need not be business days (except under
+ * `observationShift`): a calendar day that is not a business day takes the
+ * rate of the preceding business day, as in the NY Fed's SOFR Averages.
  */
 export function weightedRates(params: CompoundedSofrParams): WeightedRate[] {
   const convention = params.convention ?? { type: "plain" };
   const obs = sortObservations(params.observations);
   const dates = obs.map((o) => o.date);
-  const rateByDate = new Map(obs.map((o) => [o.date, o.rate]));
+  parse(params.start, "start");
+  parse(params.end, "end");
+  if (params.end <= params.start) throw new RangeError("end must be after start");
 
-  const startIdx = dates.indexOf(params.start);
-  if (startIdx < 0) throw new RangeError(`start ${params.start} is not a business day in observations`);
-  const endIdx = dates.indexOf(params.end);
-  if (endIdx < 0) throw new RangeError(`end ${params.end} is not a business day in observations`);
-  if (endIdx <= startIdx) throw new RangeError("end must be after start");
-
-  // Business days that set a rate during the interest period: start .. end-1.
-  const settingIdx: number[] = [];
-  for (let i = startIdx; i < endIdx; i++) settingIdx.push(i);
-
-  const shift =
-    convention.type === "lookback" || convention.type === "observationShift"
-      ? convention.businessDays
-      : 0;
-  if (shift < 0 || !Number.isInteger(shift)) {
-    throw new RangeError(`businessDays must be a non-negative integer`);
+  const n =
+    convention.type === "plain"
+      ? 0
+      : convention.type === "lookback" ||
+          convention.type === "observationShift" ||
+          convention.type === "lockout"
+        ? convention.businessDays
+        : Number.NaN;
+  if (Number.isNaN(n)) {
+    throw new RangeError(`Unknown convention type: ${(convention as { type: string }).type}`);
+  }
+  if (!Number.isInteger(n) || n < 0) {
+    throw new RangeError(`businessDays must be a non-negative integer, got ${n}`);
   }
 
-  const periods: WeightedRate[] = [];
-  const lockoutN = convention.type === "lockout" ? convention.businessDays : 0;
-  if (lockoutN < 0 || !Number.isInteger(lockoutN)) {
-    throw new RangeError(`businessDays must be a non-negative integer`);
+  // The business day whose rate is in force on `start`: `start` itself, or
+  // the preceding business day when `start` is a weekend/holiday.
+  let firstIdx = -1;
+  for (let i = 0; i < dates.length && dates[i]! <= params.start; i++) firstIdx = i;
+  if (firstIdx < 0) {
+    throw new RangeError(`No observation on or before start ${params.start}`);
+  }
+  // The last business day that sets a rate inside [start, end).
+  let lastIdx = firstIdx;
+  while (lastIdx + 1 < dates.length && dates[lastIdx + 1]! < params.end) lastIdx++;
+  const endIsObserved = dates[lastIdx + 1] === params.end;
+  if (!endIsObserved && daysBetween(dates[lastIdx]!, params.end) > MAX_TRAILING_GAP_DAYS) {
+    throw new RangeError(
+      `Observations end on ${dates[lastIdx]}, more than ${MAX_TRAILING_GAP_DAYS} days before end ${params.end}`,
+    );
+  }
+
+  if (convention.type === "observationShift") {
+    // The observation period is defined in business days, so both ends must
+    // be business days present in the series.
+    if (dates[firstIdx] !== params.start) {
+      throw new RangeError(`start ${params.start} is not a business day in observations`);
+    }
+    if (!endIsObserved) {
+      throw new RangeError(`end ${params.end} is not a business day in observations`);
+    }
+  }
+
+  // Business days that set a rate during the interest period.
+  const settingIdx: number[] = [];
+  for (let i = firstIdx; i <= lastIdx; i++) settingIdx.push(i);
+
+  const shift = convention.type === "lookback" || convention.type === "observationShift" ? n : 0;
+  const lockoutN = convention.type === "lockout" ? n : 0;
+  if (lockoutN >= settingIdx.length && lockoutN > 0) {
+    throw new RangeError(
+      `lockout of ${lockoutN} business days must be shorter than the period's ${settingIdx.length} business days`,
+    );
   }
   // Lockout freezes the rate for the last `lockoutN` business days to the rate
-  // observed on the business day that is lockoutN days before the period end.
-  const lockedFromIdx = endIdx - 1 - lockoutN;
+  // of the business day immediately before them (QuantLib's `lockoutDays`).
+  const lockedFrom = settingIdx.length - lockoutN; // position of first locked day
 
+  const periods: WeightedRate[] = [];
   for (let k = 0; k < settingIdx.length; k++) {
     const i = settingIdx[k]!;
 
     // Determine which observation supplies the RATE.
-    let rateIdx = i;
-    if (convention.type === "lookback" || convention.type === "observationShift") {
-      rateIdx = i - shift;
-    } else if (convention.type === "lockout" && i > lockedFromIdx) {
-      rateIdx = lockedFromIdx;
-    }
+    let rateIdx = i - shift;
+    if (lockoutN > 0 && k >= lockedFrom) rateIdx = settingIdx[lockedFrom - 1]!;
     if (rateIdx < 0) {
       throw new RangeError(
         `Not enough prior observations for a ${shift}-business-day shift before ${params.start}`,
       );
     }
-    const rate = rateByDate.get(dates[rateIdx]!)!;
+    const rate = obs[rateIdx]!.rate;
 
     // Determine the calendar-day WEIGHT.
     let days: number;
     if (convention.type === "observationShift") {
       // Weight from the shifted (observation) period.
-      const from = dates[i - shift]!;
-      const to = dates[i - shift + 1]!;
-      days = daysBetween(from, to);
+      days = daysBetween(dates[i - shift]!, dates[i - shift + 1]!);
     } else {
-      // Weight from the interest period itself; last day extends to `end`.
-      const from = dates[i]!;
+      // Weight from the interest period itself, clipped to [start, end).
+      const from = k === 0 ? params.start : dates[i]!;
       const to = k === settingIdx.length - 1 ? params.end : dates[i + 1]!;
       days = daysBetween(from, to);
     }
@@ -255,8 +324,9 @@ export function compoundedSofr(params: CompoundedSofrParams): number {
 
 /**
  * Interest accrued on a notional over the period: `notional × compounded/100 ×
- * totalDays/360`. `compounded` defaults to the plain compounded SOFR for the
- * period.
+ * interestDays/360`, where `interestDays` is the calendar days in the interest
+ * period `[start, end)` — also under `observationShift`, whose rate is
+ * annualized over the observation period but accrues over the interest period.
  */
 export function accruedInterest(
   notional: number,
@@ -265,10 +335,33 @@ export function accruedInterest(
   if (!Number.isFinite(notional) || notional < 0) {
     throw new RangeError(`Invalid notional: ${notional}`);
   }
-  const periods = weightedRates(params);
-  const rate = compoundInArrears(periods);
-  const totalDays = periods.reduce((s, p) => s + p.days, 0);
-  return notional * (rate / 100) * (totalDays / 360);
+  const rate = compoundInArrears(weightedRates(params));
+  return notional * (rate / 100) * (daysBetween(params.start, params.end) / 360);
+}
+
+/**
+ * The NY Fed's published SOFR Average for `asOf` (30, 90 or 180 calendar
+ * days, or any other window): compounded SOFR over `[asOf − calendarDays,
+ * asOf)`, a non-business start day taking the preceding business day's rate,
+ * rounded to 5 decimals as published. Needs observations from the business
+ * day on or before the window start through at least the business day before
+ * `asOf`.
+ *
+ * ```ts
+ * sofrAverage(observations, "2026-07-09", 30); // 3.63409
+ * ```
+ */
+export function sofrAverage(
+  observations: readonly RateObservation[],
+  asOf: string,
+  calendarDays: number,
+): number {
+  if (!Number.isInteger(calendarDays) || calendarDays <= 0) {
+    throw new RangeError(`Invalid calendarDays: ${calendarDays}`);
+  }
+  const start = new Date(parse(asOf, "asOf") - calendarDays * MS_PER_DAY).toISOString().slice(0, 10);
+  const rate = compoundedSofr({ observations, start, end: asOf });
+  return Math.round(rate * 1e5) / 1e5;
 }
 
 /**
